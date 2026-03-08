@@ -32,7 +32,7 @@ EXPERIMENT_NAME = "overnight_run_cifar_noniid_v9"
 RESULTS_CSV     = f"{EXPERIMENT_NAME}.csv"
 
 GLOBAL_ROUNDS = 100
-N_CLIENTS     = 11
+N_CLIENTS     = 50
 LOCAL_EPOCHS  = 1
 BATCH_SIZE    = 64
 LR            = 0.02
@@ -43,16 +43,19 @@ if fl_dev == "cpu":
 DEVICE = "cuda" if (fl_dev == "cuda" or (fl_dev == "" and torch.cuda.is_available())) else "cpu"
 
 # --- Scope ---
-SEEDS         = [0]
-DATASETS      = [("cifar10","tinycnn")]
-ALPHAS        = [0.1]
+SEEDS         = [0, 1, 2, 3, 4]
+DATASETS      = [
+    ("cifar10","tinycnn"), ("cifar100","tinycnn"), ("femnist","tinycnn"), ("mnist","tinycnn"),
+    ("cifar10","mobilenetv2"), ("cifar100","mobilenetv2"),
+]
+ALPHAS        = [0.1, 0.5, 1.0]
 RUN_MAIN_COMPARISON = True
 RUN_ABLATIONS       = True
 # -------------
 
 # MAIN comparison knobs
-F_GRID_MAIN          = [1, 2]
-ATTACKER_COUNTS_MAIN = [0, 2]
+F_GRID_MAIN          = [5, 10]
+ATTACKER_COUNTS_MAIN = [0, 10]
 TAU_Q_MAIN           = 0.98
 R_MAIN               = 50
 WARMUP_MAIN          = 3
@@ -61,8 +64,8 @@ USE_GUARD_MAIN       = True
 # Ablations (SK-only)
 ABLATION_DATASET      = ("cifar10","tinycnn")
 ABLATION_ALPHA        = 0.1
-F_GRID_ABL            = [1, 2, 3]
-ATTACKER_COUNTS_ABL   = [0, 2]
+F_GRID_ABL            = [5, 10, 15]
+ATTACKER_COUNTS_ABL   = [0, 10]
 TAU_QS_ABL            = [0.95, 0.98, 0.99]
 R_LIST_ABL            = [10, 25, 50, 100]
 WARMUP_LIST_ABL       = [0, 3, 5]
@@ -72,7 +75,7 @@ USE_GUARD_LIST_ABL    = [False, True]
 BASE_ATTACKERS = {
     "none":           {"type": "none"},
     "sign_flip":      {"type": "sign",   "scale": -3.0},
-    "label_flip":     {"type": "label",  "map": {k: (k+5)%10 for k in range(10)}},
+    "label_flip":     {"type": "label",  "map": "auto"},  # resolved per-dataset in _resolve_label_map
     "min_max":        {"type": "min_max", "scale": 3.0},
     "adaptive_steer": {"type": "steer",  "gamma": 3.0},
     "buffer_drift":   {"type": "buffer", "drift_rounds": 20, "drift_scale": 0.15, "hit_period": 5, "hit_scale": 1.5},
@@ -145,10 +148,10 @@ def trimmed_mean_agg(deltas: np.ndarray, f: int = 0, frac: float = 0.1, **_) -> 
 class CSVLogger:
     DEFAULT_FIELDS = [
         "seed","dataset","model","alpha","attack","attacker_count","algo",
-        "f_param","use_guard","warmup_rounds","r","guard_min_kept","tau_quantile",
+        "f_param","use_guard","warmup_rounds","r","tau_quantile",
         "round","acc","asr",
         "U_rank","pre_guard_selected","num_guard_kept","tau_buffer",
-        "guard_target","guard_dropped","guard_fallback_used",
+        "guard_dropped","guard_fallback_used",
         "time_ms_total","time_ms_proj","time_ms_pairwise","time_ms_guard","time_ms_refresh","time_ms_other",
         "atk_state_used","atk_adv_idx",
         "fallback","bulyan_krum_fallback",
@@ -371,7 +374,11 @@ class SpectralKrumConfig:
     warmup_rounds: int = 3
     refresh_every: int = 1
     orthE_quantile_from_buffer: float = 0.98
-    guard_min_kept: int = 1
+    guard_alpha: float = 2.0
+    guard_w_min: float = 0.01
+    guard_w_max: float = 5.0
+    guard_hard_reject_frac: float = 0.05
+    guard_tau_blend: float = 0.6
     f_byzantine: int = 1
     clip_norm: float = 0.0
     seed: int = 0
@@ -518,27 +525,52 @@ class SpectralKrum:
         t_pair_ms = (t_pair1 - t_pair0) * 1e3
 
         t_guard0 = time.time()
-        kept = pre_sel
         guard_fallback_used = 0
-
-        k_krum = int(pre_sel.size)
-        target = max(1, k_krum - f)
+        guard_dropped = 0
 
         if use_guard and self.U is not None:
             resid = np.linalg.norm(deltas - (Z @ self.U.T), axis=1)
-            tau = self._tau_buffer
-            mask = resid[pre_sel] <= tau
-            kept = pre_sel[mask]
+            r_sel = resid[pre_sel]
 
-            if kept.size < self.cfg.guard_min_kept:
+            # --- adaptive tau from current-round robust stats ---
+            med = float(np.median(r_sel))
+            mad = float(np.median(np.abs(r_sel - med))) + 1e-9
+            tau_current = med + 3.0 * mad
+
+            # --- blend with historical tau ---
+            beta = self.cfg.guard_tau_blend
+            if self._tau_buffer > 0:
+                tau = beta * self._tau_buffer + (1.0 - beta) * tau_current
+            else:
+                tau = tau_current
+
+            # --- safety cap: hard-reject exactly top fraction of worst residuals ---
+            n_sel = len(pre_sel)
+            n_reject = max(0, int(np.floor(self.cfg.guard_hard_reject_frac * n_sel)))
+            hard_mask = np.ones(n_sel, dtype=bool)
+            if 0 < n_reject < n_sel:
+                worst_idx = np.argpartition(r_sel, -n_reject)[-n_reject:]
+                hard_mask[worst_idx] = False
+
+            # --- bounded soft weights ---
+            alpha = self.cfg.guard_alpha
+            raw_w = np.exp(-alpha * r_sel / max(tau, 1e-9))
+            raw_w = np.clip(raw_w, self.cfg.guard_w_min, self.cfg.guard_w_max)
+            raw_w[~hard_mask] = 0.0
+
+            w_sum = raw_w.sum()
+            if w_sum > 0:
+                weights = raw_w / w_sum
+                guard_dropped = int((raw_w == 0.0).sum())
+            else:
                 guard_fallback_used = 1
-                order = np.argsort(resid[pre_sel])[: self.cfg.guard_min_kept]
-                kept = pre_sel[order]
+                weights = np.ones(n_sel) / n_sel
+                guard_dropped = 0
+            agg = (deltas[pre_sel] * weights[:, None]).sum(axis=0).astype(np.float32)
+        else:
+            agg = deltas[pre_sel].mean(axis=0).astype(np.float32)
 
         t_guard1 = time.time()
-        guard_dropped = int(pre_sel.size - kept.size)
-
-        agg = deltas[kept].mean(axis=0).astype(np.float32)
         self.buffer.append(agg.copy())
         if len(self.buffer) > self.cfg.buffer_size:
             self.buffer.pop(0)
@@ -555,7 +587,7 @@ class SpectralKrum:
             "mode": "main",
             "U_rank": int(self.U.shape[1] if self.U is not None else 0),
             "pre_guard_selected": int(pre_sel.size),
-            "num_guard_kept": int(kept.size),
+            "num_guard_kept": int(pre_sel.size - guard_dropped),
             "tau_buffer": float(self._tau_buffer),
             "new_global": new_global,
             "time_ms_proj": t_proj_ms,
@@ -564,7 +596,6 @@ class SpectralKrum:
             "time_ms_refresh": t_refresh,
             "time_ms_total": t_total_ms,
             "time_ms_other": t_other_ms,
-            "guard_target": int(target),
             "guard_dropped": guard_dropped,
             "guard_fallback_used": guard_fallback_used,
         })
@@ -673,15 +704,53 @@ def make_worker_init_fn(base_seed: int):
 
 # Data and model
 def get_client_datasets(dataset_name: str, num_clients: int, alpha: float, seed: int) -> Tuple[List[Subset], Dataset]:
-    if dataset_name.lower() != "cifar10":
-        raise ValueError("dataset_name must be 'cifar10'")
+    name = dataset_name.lower()
 
-    mean, std = (0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)
-    train_tf = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
-    test_tf  = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
-    trainset = datasets.CIFAR10(root="./data", train=True, download=False, transform=train_tf)
-    testset  = datasets.CIFAR10(root="./data", train=False, download=False, transform=test_tf)
-    num_classes = 10
+    if name == "cifar10":
+        mean, std = (0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)
+        train_tf = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
+        test_tf  = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
+        trainset = datasets.CIFAR10(root="./data", train=True, download=False, transform=train_tf)
+        testset  = datasets.CIFAR10(root="./data", train=False, download=False, transform=test_tf)
+        num_classes = 10
+
+    elif name == "cifar100":
+        mean, std = (0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)
+        train_tf = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
+        test_tf  = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
+        trainset = datasets.CIFAR100(root="./data", train=True, download=False, transform=train_tf)
+        testset  = datasets.CIFAR100(root="./data", train=False, download=False, transform=test_tf)
+        num_classes = 100
+
+    elif name == "mnist":
+        mean, std = (0.1307,), (0.3081,)
+        train_tf = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
+        test_tf  = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
+        trainset = datasets.MNIST(root="./data", train=True, download=False, transform=train_tf)
+        testset  = datasets.MNIST(root="./data", train=False, download=False, transform=test_tf)
+        num_classes = 10
+
+    elif name == "femnist":
+        # FEMNIST uses EMNIST ByClass split (62 classes: 0-9, A-Z, a-z)
+        mean, std = (0.1307,), (0.3081,)
+        train_tf = transforms.Compose([
+            transforms.Lambda(lambda img: transforms.functional.rotate(img, -90)),
+            transforms.Lambda(lambda img: transforms.functional.hflip(img)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+        test_tf = transforms.Compose([
+            transforms.Lambda(lambda img: transforms.functional.rotate(img, -90)),
+            transforms.Lambda(lambda img: transforms.functional.hflip(img)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+        trainset = datasets.EMNIST(root="./data", split="byclass", train=True, download=False, transform=train_tf)
+        testset  = datasets.EMNIST(root="./data", split="byclass", train=False, download=False, transform=test_tf)
+        num_classes = 62
+
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}. Supported: cifar10, cifar100, mnist, femnist")
 
     rng = np.random.default_rng(seed)
     y = np.array(trainset.targets, dtype=np.int64)
@@ -699,6 +768,12 @@ def get_client_datasets(dataset_name: str, num_clients: int, alpha: float, seed:
         for j in range(num_clients):
             client_bins[j].extend(parts[j].tolist())
 
+    # Ensure no client is empty: donate one sample from the largest client
+    for j in range(num_clients):
+        if len(client_bins[j]) == 0:
+            donor = max(range(num_clients), key=lambda k: len(client_bins[k]))
+            client_bins[j].append(client_bins[donor].pop())
+
     client_subsets = []
     for j in range(num_clients):
         arr = np.array(client_bins[j], dtype=np.int64)
@@ -707,7 +782,7 @@ def get_client_datasets(dataset_name: str, num_clients: int, alpha: float, seed:
     return client_subsets, testset
 
 class TinyCNN(nn.Module):
-    def __init__(self, in_ch: int = 3, n_classes: int = 10):
+    def __init__(self, in_ch: int = 3, img_size: int = 32, n_classes: int = 10):
         super().__init__()
         c1 = 16
         self.features = nn.Sequential(
@@ -716,21 +791,72 @@ class TinyCNN(nn.Module):
             nn.Conv2d(c1, 32, 3, padding=1), nn.ReLU(),
             nn.MaxPool2d(2),
         )
-        flat = 32*8*8 if in_ch == 3 else 32*7*7
+        flat_size = 32 * (img_size // 4) * (img_size // 4)
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(flat, 64), nn.ReLU(),
+            nn.Linear(flat_size, 64), nn.ReLU(),
             nn.Linear(64, n_classes)
         )
     def forward(self, x):
         return self.classifier(self.features(x))
 
+
+def _dataset_meta(dataset: str) -> Tuple[int, int, int]:
+    """Returns (in_channels, img_size, num_classes) for a dataset."""
+    d = dataset.lower()
+    if d == "cifar10":
+        return 3, 32, 10
+    elif d == "cifar100":
+        return 3, 32, 100
+    elif d == "mnist":
+        return 1, 28, 10
+    elif d == "femnist":
+        return 1, 28, 62
+    else:
+        raise ValueError(f"Unknown dataset: {dataset}")
+
+
+def _resolve_label_map(dataset: str) -> dict:
+    """Generate a label-flip map: shift labels by half the number of classes."""
+    _, _, n_classes = _dataset_meta(dataset)
+    shift = n_classes // 2
+    return {k: (k + shift) % n_classes for k in range(n_classes)}
+
+
+class MobileNetV2(nn.Module):
+    """MobileNetV2 adapted for small images (28x28 or 32x32)."""
+    def __init__(self, in_ch: int = 3, img_size: int = 32, n_classes: int = 10):
+        super().__init__()
+        from torchvision.models import mobilenet_v2
+        base = mobilenet_v2(weights=None)
+        # Replace first conv to accept any input channels and use stride=1
+        # for small images (original stride=2 loses too much resolution)
+        base.features[0][0] = nn.Conv2d(in_ch, 32, kernel_size=3, stride=1, padding=1, bias=False)
+        # Also reduce stride in the second InvertedResidual if image is small
+        if img_size <= 32 and hasattr(base.features[2], 'conv') and len(base.features[2].conv) > 0:
+            for m in base.features[2].modules():
+                if isinstance(m, nn.Conv2d) and m.stride == (2, 2):
+                    m.stride = (1, 1)
+        self.features = base.features
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.classifier = nn.Linear(base.last_channel, n_classes)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.pool(x)
+        x = x.flatten(1)
+        return self.classifier(x)
+
+
 def make_model(model_name: str, dataset: str) -> nn.Module:
-    if model_name.lower() != "tinycnn":
-        raise ValueError("model_name must be 'tinycnn'")
-    if dataset.lower() != "cifar10":
-        raise ValueError("dataset must be 'cifar10'")
-    return TinyCNN(in_ch=3, n_classes=10)
+    in_ch, img_size, n_classes = _dataset_meta(dataset)
+    name = model_name.lower()
+    if name == "tinycnn":
+        return TinyCNN(in_ch=in_ch, img_size=img_size, n_classes=n_classes)
+    elif name == "mobilenetv2":
+        return MobileNetV2(in_ch=in_ch, img_size=img_size, n_classes=n_classes)
+    else:
+        raise ValueError(f"Unknown model: {model_name}. Supported: tinycnn, mobilenetv2")
 
 @torch.no_grad()
 def test_model(model: nn.Module, testset: Dataset, device: str, seed=123) -> float:
@@ -769,9 +895,10 @@ class LabelMapSubset(Dataset):
         self.base = base_subset
         self.label_map = dict(label_map)
         base_targets = np.array(self.base.dataset.targets)
-        self.targets = base_targets[self.base.indices].copy()
+        orig = base_targets[self.base.indices].copy()
+        self.targets = orig.copy()
         for a, b in self.label_map.items():
-            self.targets[self.targets == a] = b
+            self.targets[orig == a] = b
     def __len__(self): return len(self.base)
     def __getitem__(self, i):
         x, _ = self.base[i]
@@ -1087,7 +1214,7 @@ def run_simulation_for_algo(
     seed, dataset_name, model_name, alpha,
     attack_name, base_cfg, attacker_count,
     f_param, use_guard, warmup_rounds, r_dim,
-    tau_q, guard_min_kept, device
+    tau_q, device
 ):
     set_all_seeds(seed)
     run_rows = []
@@ -1108,7 +1235,6 @@ def run_simulation_for_algo(
             r=r_dim, buffer_size=50, center_mode="mean", trim_mode="two_sided", trim_frac=0.1,
             warmup_rounds=warmup_rounds, refresh_every=1,
             orthE_quantile_from_buffer=tau_q,
-            guard_min_kept=guard_min_kept,
             f_byzantine=f_param, clip_norm=0.0, seed=seed
         )
         sk_server = SpectralKrum(sk_cfg)
@@ -1134,6 +1260,11 @@ def run_simulation_for_algo(
 
     rng_global = np.random.default_rng(seed)
     fixed_attackers = _make_attack_indices(N_CLIENTS, attacker_count, rng_global)
+
+    # Resolve auto label-flip map for the current dataset
+    if base_cfg.get("type") == "label" and base_cfg.get("map") == "auto":
+        base_cfg = base_cfg.copy()
+        base_cfg["map"] = _resolve_label_map(dataset_name)
 
     ds_for_run = client_subsets
     if attack_name == "label_flip":
@@ -1212,7 +1343,7 @@ def run_simulation_for_algo(
             "alpha": alpha, "attack": attack_name, "attacker_count": attacker_count,
             "algo": algo_name, "f_param": f_param,
             "use_guard": use_guard, "warmup_rounds": warmup_rounds,
-            "r": r_dim, "guard_min_kept": guard_min_kept, "tau_quantile": tau_q,
+            "r": r_dim, "tau_quantile": tau_q,
             "round": round_idx, "acc": acc, "asr": asr_val,
             "U_rank": info.get("U_rank", ""),
             "pre_guard_selected": info.get("pre_guard_selected", ""),
@@ -1228,7 +1359,6 @@ def run_simulation_for_algo(
             "atk_adv_idx": ";".join(map(str, adv_idx)),
             "fallback": info.get("fallback", ""),
             "bulyan_krum_fallback": info.get("bulyan_krum_fallback", ""),
-            "guard_target": info.get("guard_target",""),
             "guard_dropped": info.get("guard_dropped",""),
             "guard_fallback_used": info.get("guard_fallback_used",""),
             "guard_tp": info.get("guard_tp",""),
@@ -1245,13 +1375,19 @@ def run_simulation_for_algo(
     return run_rows
 
 def pre_download_datasets():
-    print("Pre-downloading CIFAR-10...")
-    try:
-        datasets.CIFAR10(root="./data", train=True, download=True)
-        datasets.CIFAR10(root="./data", train=False, download=True)
-        print("CIFAR-10 download complete.")
-    except Exception as e:
-        print(f"Could not pre-download CIFAR-10: {e}. Workers might fail.")
+    for name, cls, kwargs in [
+        ("CIFAR-10",  datasets.CIFAR10,  {}),
+        ("CIFAR-100", datasets.CIFAR100, {}),
+        ("MNIST",     datasets.MNIST,    {}),
+        ("EMNIST",    datasets.EMNIST,   {"split": "byclass"}),
+    ]:
+        print(f"Pre-downloading {name}...")
+        try:
+            cls(root="./data", train=True,  download=True, **kwargs)
+            cls(root="./data", train=False, download=True, **kwargs)
+            print(f"  {name} OK.")
+        except Exception as e:
+            print(f"  Could not pre-download {name}: {e}. Workers might fail.")
 
 def _run_job(args):
     t0 = time.time()
@@ -1292,7 +1428,6 @@ def main():
             for (dataset_name, model_name) in DATASETS:
                 for alpha in ALPHAS:
                     for f_param in F_GRID_MAIN:
-                        guard_min_kept = max(1, N_CLIENTS - 2*f_param - 2)
                         for attacker_count in ATTACKER_COUNTS_MAIN:
                             if attacker_count > 0 and f_param < attacker_count:
                                 continue
@@ -1310,7 +1445,7 @@ def main():
                                         seed, dataset_name, model_name, alpha,
                                         attack_name, job_cfg, attacker_count,
                                         f_param, USE_GUARD_MAIN, WARMUP_MAIN, R_MAIN,
-                                        TAU_Q_MAIN, guard_min_kept, selected_device
+                                        TAU_Q_MAIN, selected_device
                                     ))
 
     if RUN_ABLATIONS:
@@ -1318,7 +1453,6 @@ def main():
         dataset_name, model_name = ABLATION_DATASET
         alpha = ABLATION_ALPHA
         for f_param in F_GRID_ABL:
-            guard_min_kept = max(1, N_CLIENTS - 2*f_param - 2)
             for attacker_count in ATTACKER_COUNTS_ABL:
                 if attacker_count > 0 and f_param < attacker_count:
                     continue
@@ -1334,7 +1468,7 @@ def main():
                                     seed, dataset_name, model_name, alpha,
                                     attack_name, base_cfg, attacker_count,
                                     f_param, use_guard, warmup_rounds, r_dim,
-                                    tau_q, guard_min_kept, selected_device
+                                    tau_q, selected_device
                                 ))
 
     print(f"Total jobs: {len(all_job_args)}")
@@ -1381,18 +1515,133 @@ def main():
 
     print("\n===== ALL JOBS COMPLETE =====")
     if written > 0:
-        print(f"Wrote {written} rows  {RESULTS_CSV}")
+        print(f"Wrote {written} rows -> {RESULTS_CSV}")
+        print("\nGenerating overhead comparison table...")
+        try:
+            generate_overhead_table(RESULTS_CSV)
+        except Exception as e:
+            print(f"Could not generate overhead table: {e}")
     else:
         print("No rows produced; skipping analysis.")
+
+
+def generate_overhead_table(csv_path: str):
+    """Generate a computational overhead comparison table from results CSV.
+
+    Produces two tables:
+      1. Mean wall-clock time per round (ms) for each aggregator, grouped by dataset+model.
+      2. SpectralKrum breakdown: proj, pairwise, guard, refresh, other.
+
+    Prints LaTeX-ready and human-readable tables, and saves to overhead_table.csv.
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        print("[WARNING] pandas is required for overhead table generation. "
+              "Install with: pip install pandas")
+        return
+
+    df = pd.read_csv(csv_path)
+
+    required_cols = {"round", "time_ms_total", "dataset", "model", "algo"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        print(f"[WARNING] CSV missing columns {missing}; cannot generate overhead table.")
+        return
+
+    # Coerce round and timing columns to numeric
+    df["round"] = pd.to_numeric(df["round"], errors="coerce")
+
+    # Only use rounds after warmup (round > 5) to measure steady-state overhead
+    df = df[df["round"] > 5].copy()
+
+    df["time_ms_total"] = pd.to_numeric(df["time_ms_total"], errors="coerce")
+    df = df.dropna(subset=["time_ms_total"])
+
+    # --- Table 1: Mean time per round by algorithm, dataset, model ---
+    grp = df.groupby(["dataset", "model", "algo"])["time_ms_total"]
+    summary = grp.agg(["mean", "std", "count"]).reset_index()
+    summary.columns = ["dataset", "model", "algo", "mean_ms", "std_ms", "n_rounds"]
+    summary["mean_ms"] = summary["mean_ms"].round(2)
+    summary["std_ms"] = summary["std_ms"].round(2)
+
+    print("\n" + "=" * 80)
+    print("TABLE: Aggregation Time per Round (ms) — mean ± std")
+    print("=" * 80)
+
+    for (ds, mdl), group in summary.groupby(["dataset", "model"]):
+        print(f"\n  Dataset: {ds}  |  Model: {mdl}")
+        print(f"  {'Algorithm':<20s} {'Mean (ms)':>10s} {'± Std':>10s} {'Rounds':>8s}")
+        print(f"  {'-'*50}")
+        group_sorted = group.sort_values("mean_ms")
+        for _, row in group_sorted.iterrows():
+            print(f"  {row['algo']:<20s} {row['mean_ms']:>10.2f} {row['std_ms']:>10.2f} {int(row['n_rounds']):>8d}")
+
+    # --- Table 2: SpectralKrum internal breakdown ---
+    sk_df = df[df["algo"] == "SpectralKrum"].copy()
+    timing_cols = ["time_ms_proj", "time_ms_pairwise", "time_ms_guard", "time_ms_refresh", "time_ms_other"]
+    for col in timing_cols:
+        sk_df[col] = pd.to_numeric(sk_df[col], errors="coerce").fillna(0.0)
+
+    if len(sk_df) > 0:
+        print("\n" + "=" * 80)
+        print("TABLE: SpectralKrum Internal Timing Breakdown (ms) — mean ± std")
+        print("=" * 80)
+
+        for (ds, mdl), group in sk_df.groupby(["dataset", "model"]):
+            print(f"\n  Dataset: {ds}  |  Model: {mdl}")
+            print(f"  {'Component':<20s} {'Mean (ms)':>10s} {'± Std':>10s} {'% of Total':>12s}")
+            print(f"  {'-'*55}")
+            total_mean = group["time_ms_total"].mean()
+            for col in timing_cols:
+                label = col.replace("time_ms_", "")
+                m = group[col].mean()
+                s = group[col].std()
+                pct = 100.0 * m / total_mean if total_mean > 0 else 0.0
+                print(f"  {label:<20s} {m:>10.2f} {s:>10.2f} {pct:>11.1f}%")
+            print(f"  {'TOTAL':<20s} {total_mean:>10.2f}")
+
+    # --- Save to CSV for paper use ---
+    out_path = csv_path.replace(".csv", "_overhead.csv")
+    summary.to_csv(out_path, index=False)
+    print(f"\nOverhead table saved to: {out_path}")
+
+    # --- LaTeX snippet ---
+    print("\n% LaTeX table (paste into paper):")
+    print("\\begin{table}[t]")
+    print("\\centering")
+    print("\\caption{Mean aggregation time per round (ms).}")
+    print("\\begin{tabular}{llrr}")
+    print("\\toprule")
+    print("Dataset & Algorithm & Mean (ms) & Std (ms) \\\\")
+    print("\\midrule")
+    prev_ds = None
+    for _, row in summary.sort_values(["dataset", "model", "mean_ms"]).iterrows():
+        ds_label = f"{row['dataset']}/{row['model']}"
+        if ds_label != prev_ds:
+            if prev_ds is not None:
+                print("\\midrule")
+            prev_ds = ds_label
+        print(f"{ds_label} & {row['algo']} & {row['mean_ms']:.2f} & {row['std_ms']:.2f} \\\\")
+    print("\\bottomrule")
+    print("\\end{tabular}")
+    print("\\end{table}")
 
 
 if __name__ == "__main__":
     import sys
 
     if any(a in ("-h", "--help") for a in sys.argv[1:]):
-        print("Usage: python final.py [--help] [--download-only] [--dry-run]")
-        print("  --download-only  Download CIFAR-10 to ./data then exit")
-        print("  --dry-run        Print job count then exit (no download/run)")
+        print("Usage: python Spectral_Krum.py [--help] [--download-only] [--dry-run] [--overhead CSV]")
+        print("  --download-only    Download all datasets to ./data then exit")
+        print("  --dry-run          Print job count then exit (no download/run)")
+        print("  --overhead CSV     Generate overhead comparison table from existing results CSV")
+        raise SystemExit(0)
+
+    if "--overhead" in sys.argv[1:]:
+        idx = sys.argv.index("--overhead")
+        csv_file = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else RESULTS_CSV
+        generate_overhead_table(csv_file)
         raise SystemExit(0)
 
     if "--download-only" in sys.argv[1:]:
